@@ -3,7 +3,7 @@
 /**
  * @package Facebook API General clas
  * @author: R.iskey / 4r.iskey@gmail.com
- * @copyright 2015 Luzy Standler 
+ * @copyright 2015 R.iskey
  * 
  * First step: require autoload.php, which is include Facebook SDK
  * Second:  Work auth() function from FacebookController auth() action
@@ -11,6 +11,7 @@
  * @var $appId - facebook application id
  * @var $appSecret - facebook app secret key
  * @var $redirect_url - redirect uri, after facebook login success {this class auth() function}
+ * @var $permissions - array where save user permissions for any action 
  * @var $_accessToken - Long term access token(default 0~60) days
  *  @link:  https://developers.facebook.com/docs/facebook-login/access-tokens#termtokens
  * @var $token_credentials - existed access_token from DB users table
@@ -30,22 +31,22 @@ Class SFacebook extends CApplicationComponent
     public $appId;
     public $appSecret;
     public $redirect_url;
+    public $permission;
 
     private $_accessToken = null;
     private $token_credentials;
 
 
-    ######## Initialize function ########
+    ######## Initialize functions ########
 
     /** 
-    * [_getSession description]
     *
     * @param $FacebookRedirectLoginHelper [Graph api object]
     * 
     * Get FB session from redirect url first time only,
-    * when user authorizating, each _getSession()
-    * call created new FB session 
-    * with specified access token.
+    * when user authorizating, each _getSession() call
+    * create new FB session 
+    * use specified access token.
     * 
     * @return current $session
     * 
@@ -64,7 +65,10 @@ Class SFacebook extends CApplicationComponent
             }
         }
         
-        /* Create new session */
+        /**
+        * Create new session use accesstoken
+        * @see connect()
+        */
         if (!$session) {
             FacebookSession::setDefaultApplication($this->appId, $this->appSecret);
             $session = new FacebookSession($this->_accessToken);      
@@ -74,7 +78,6 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
-     * [setAccessToken description]
      * set $_accessToken
      * @param token [string]
      */
@@ -89,26 +92,27 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
-     * [getPageAccessToken description]
+     * get users custom page access token from db
      * @param  $page[int] 
      * @return [int/false]
      */
     private function getPageAccessToken($page){
 
         if (is_numeric($page)) {
-            $access_token =  ServiceFacebook::model()->findByAttributes(array(
+            $access_credentials =  ServiceFacebook::model()->findByAttributes(array(
                 'service_facebook_id'=>$page,
                 'user_fid'=> Yii::app()->user->id,
                 'page_type'=> 0,
             ));
-            return $access_token->access_token;
+            return $access_credentials->access_token;
         }
         return false;
     }
 
+
+
     /**
-     * [connect description]
-     * get connection with FB
+     * Establish facebook connection
      * @return [true/false]
      */
     private function connect(){
@@ -123,13 +127,22 @@ Class SFacebook extends CApplicationComponent
         ));
         
         if (!$this->token_credentials) {
+            Yii::app()->user->setFlash('facebook.error', Yii::t('app', '{service} is not properly configured.', array(
+                '{service}'=>'Facebook')
+            ));
             return false;
         }
 
+        //Set access token from signed user
         $this->setAccessToken($this->token_credentials['access_token']);
+        
+        //register permissions for any action
+        $perms = json_decode($this->token_credentials['permissions'], true);
+        $this->permission = $perms;
 
         return true;
     }
+
 
     /**
     * Check connection 
@@ -188,10 +201,11 @@ Class SFacebook extends CApplicationComponent
             }
 
             /** 
-            *  Try to get user data and user pages 
+            *  Try to get user data, permissions for any action and user pages 
             *  with batch request
             */
             try {
+
               $params = [
                 [
                   "method"  => "GET",
@@ -206,6 +220,7 @@ Class SFacebook extends CApplicationComponent
                   "relative_url"  => "me/permissions",
                 ] 
               ];
+
               // urlencode() required!
               $user_data = (new FacebookRequest($session, 'POST',
                 '?batch='.urlencode(json_encode($params)).'&include_headers=false')
@@ -234,6 +249,16 @@ Class SFacebook extends CApplicationComponent
                 $serviceFacebook->publish = 1;
                 $serviceFacebook->page_type = 1; // 1 = user profile
 
+                //user permissions
+                if ($user_data[2]->code == 200) {
+                    $permissions = json_decode($user_data[2]->body);
+                    foreach ($permissions->data as $permission) {
+                        if ($permission->status === 'granted' ) {
+                            $granted_perm[] = $permission->permission;    
+                        }
+                    }
+                }
+                $serviceFacebook->permissions = json_encode($granted_perm);
                 $serviceFacebook->save();
 
                 /**
@@ -268,22 +293,6 @@ Class SFacebook extends CApplicationComponent
                 }
             }
 
-            //user permissions
-            if ($user_data[2]->code == 200) {
-                $permissions = json_decode($user_data[2]->body);
-
-                foreach ($permissions->data as $permission) {
-                    $serviceFacebookPermissions = new ServiceFacebookPermissions;
-
-                    if ($permission->status == 'granted' ) {
-                        $serviceFacebookPermissions->status = 1;
-                    }
-                    $serviceFacebookPermissions->permission = $permission->permission;
-                    $serviceFacebookPermissions->save();
-                }
-            }
-            
-
         } else {
             throw new CException('Facebook Session is not defined');
         }
@@ -300,6 +309,10 @@ Class SFacebook extends CApplicationComponent
      */
     public function deauth(){
 
+
+        // Revoke permissions 
+        $this->revoke();
+        
         ServiceFacebook::model()->deleteAllByAttributes(array(
             'user_fid'=>Yii::app()->user->id
         ));
@@ -312,14 +325,21 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
-     * NOT FINISHED
-     * [revoke description]
-     * Delete users permissions
+     * Delete users permissions on logout
      * @return [true/false]
      */
     public function revoke(){
-        $user_data = (new FacebookRequest($session, 'DELETE',
+
+        try
+        {
+            $this->connect();
+            $session = $this->_getSession();
+            $user_data = (new FacebookRequest($session, 'DELETE',
             '/me/permissions'))->execute()->getGraphObject();
+        }
+        catch(Exception $e) {
+            return false;
+        }  
 
         return true;
     }
@@ -328,7 +348,6 @@ Class SFacebook extends CApplicationComponent
     ######## POST(Action) Functions ########
 
     /**
-     * [update description]
      * Post new status from user or user page 
      * @param  post [array] - Post text, image
      * @param  pages [array] - checkbox checked data
@@ -343,6 +362,12 @@ Class SFacebook extends CApplicationComponent
         try 
         {
             $this->connect();
+            
+            // Check permissions
+            if (!in_array('publish_actions', $this->permission)) {
+                return false;
+            }
+
             //Get pages which from post to update
             if (!empty($pages)) {
                 foreach ($pages as $page) {
@@ -355,8 +380,7 @@ Class SFacebook extends CApplicationComponent
                       $session, 'POST', "/$page/feed", $post
                     ))->execute()->getGraphObject();
                 }
-            } 
-            else {
+            } else {
                 //get session for user
                 $session = $this->_getSession();
                 $post_id = (new FacebookRequest(
@@ -374,6 +398,7 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
+     * Like unlike functionality
      * @param  $feed_id [string] - post id
      * @param  $is_page [string] - user's page id
      * @return [true/false]
@@ -390,6 +415,12 @@ Class SFacebook extends CApplicationComponent
         try
         {
             $this->connect();
+
+            // Check permissions
+            if (!in_array('publish_actions', $this->permission)) {
+                return false;
+            }
+
             if ($is_page) {
                 $token = $this->getPageAccessToken($is_page);
                 $this->setAccessToken($token);
@@ -431,7 +462,7 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
-     * [comment description]
+     * Add comment action
      * @param  $comment_data [array] - comment message/id
      * @param  $is_page [string] - user's page id
      * @return [true/false]
@@ -441,6 +472,12 @@ Class SFacebook extends CApplicationComponent
         try 
         {
             $this->connect();
+
+            // Check permissions
+            if (!in_array('publish_actions', $this->permission)) {
+                return false;
+            }
+
             if ($is_page) {
                 $token = $this->getPageAccessToken($is_page);
                 $this->setAccessToken($token);
@@ -481,11 +518,10 @@ Class SFacebook extends CApplicationComponent
     }
 
 
-    ######## GET data functions From Facebook ########
+    ######## GET functions From Facebook API ########
 
     /**
-     * [getNotifications saveNotifications description]
-     * get User notifications and save
+     * get User notifications
      * @return [true/false]
      */
     public function getNotifications(){
@@ -493,6 +529,12 @@ Class SFacebook extends CApplicationComponent
         try 
         {
             $this->connect();
+
+            // Check permissions
+            if (!in_array('manage_notifications', $this->permission)) {
+                return false;
+            }
+
             $session = $this->_getSession();
             $notifications = (new FacebookRequest(
               $session, 'GET', '/me/notifications'
@@ -515,6 +557,11 @@ Class SFacebook extends CApplicationComponent
         try 
         {
             $this->connect();
+            // Check permissions
+            if (!in_array('read_stream', $this->permission)) {
+                return false;
+            }
+
             $session = $this->_getSession();
 
             /** 
@@ -564,8 +611,7 @@ Class SFacebook extends CApplicationComponent
     }
 
    /**
-    * [getPages description]
-    *
+    * get user pages from db
     * @param  $active[boolean] - search by active pages
     * @return false/[model object]
     */
@@ -578,15 +624,8 @@ Class SFacebook extends CApplicationComponent
             :  $serviceFacebookPages = ServiceFacebook::model()->pages()->findAll();
     }
 
-    /**
-     * [getPageFeed description]
-     * Different between getFeed() is this function send batch request
-     * @link https://developers.facebook.com/docs/graph-api/making-multiple-requests
-     * @param  $pages [object]
-     * @return [graph object/false]
-     */
 
-    ######## SAVE functions work with MySql ########
+    ######## SAVE functions ########
 
     public function saveFeed($page_feed_data){ 
     
@@ -658,7 +697,6 @@ Class SFacebook extends CApplicationComponent
                                 $serviceFacebookFeed->is_liked = $is_liked;
                                 $serviceFacebookFeed->like_count = count($likes);
                                 $serviceFacebookFeed->page_type = $pageType[$facebook_fid];
-
                                 
                             }
 
@@ -774,9 +812,7 @@ Class SFacebook extends CApplicationComponent
 
 
     /**
-    * [updateFeedFromDB description]
-    * Update comments and likes from DB
-    * this method for realtime update 
+    * Update comments and likes in DB realtime actions
     * @param $data [array]
     * @param $is_page [string] - user's page id
     */
@@ -827,7 +863,6 @@ Class SFacebook extends CApplicationComponent
     }
 
     /**
-     * [deleteOldEntities description]
      * Delete removed entries from database
      * @param  $data [array]
      * @return [boolean]
@@ -864,7 +899,7 @@ Class SFacebook extends CApplicationComponent
                         ServiceFacebookFeed::model()->deleteAll($criteriaForDelete);
                     }                
                 }              
-            }  
+            }        
         return true;
     }
 }
