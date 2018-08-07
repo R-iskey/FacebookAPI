@@ -1,2 +1,3 @@
 # FacebookAPI
-Facebook sdk 4.0 Class File
+***NOTE:*** This Repository is deprecated, please find alternative helpers.
+Facebook SDK v.4 integration with Yii 1 framework
